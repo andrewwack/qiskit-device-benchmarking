@@ -11,6 +11,7 @@
 
 import copy
 from functools import lru_cache
+import time
 from typing import Callable, List, Optional, Sequence
 
 import numpy as np
@@ -354,6 +355,71 @@ def run_parameterized(
     
     return job
 
+def run_instantiated(
+    backend: Backend,
+    width: int,
+    layers: int,
+    shots: int,
+    rep_delay: float,
+    num_circuits: int,
+    batch_size: int,
+):
+    """
+    Run instantiated circuits in batches through Sampler in session mode.
+    
+    Args:
+        backend: The backend to run on
+        width: Circuit width
+        layers: Number of layers
+        shots: Shots per circuit
+        rep_delay: Repetition delay
+        num_circuits: Total number of circuits to run
+        batch_size: Maximum number of circuits per job batch
+    
+    Returns:
+        List of job objects from all batches
+    """
+    # Create the parameterized circuit
+    (transpiled_circ, parameters) = create_hardware_aware_circuit(
+        width=width, layers=layers, backend=backend, parameterized=True
+    )
+    
+    seed = 234987
+    rng = np.random.default_rng(seed)
+    
+    # Calculate number of batches needed
+    num_batches = (num_circuits + batch_size - 1) // batch_size
+    
+    # Store all jobs
+    jobs = []
+    
+    # Run in session mode for optimal throughput
+    with Session(backend=backend) as session:
+        sampler = Sampler(mode=session)
+        
+        for batch_idx in range(num_batches):
+            # Calculate circuits for this batch
+            circuits_in_batch = min(batch_size, num_circuits - batch_idx * batch_size)
+            
+            # Create instantiated circuits for this batch
+            instantiated_circuits = []
+            print(time.time())
+            print(f"Processing batch {batch_idx + 1}/{num_batches} with {circuits_in_batch} circuits")
+            for _ in range(circuits_in_batch):
+                # Generate random parameters
+                param_values = {param: rng.uniform(0, np.pi * 2) for param in transpiled_circ.parameters}
+                # Bind parameters to create instantiated circuit
+                instantiated_circuits.append(transpiled_circ.assign_parameters(param_values))
+            
+            # Submit batch job
+            print(time.time())
+            print(f"Submitting batch {batch_idx + 1}/{num_batches} with {circuits_in_batch} circuits")
+            job = sampler.run(instantiated_circuits, shots=shots)
+            jobs.append(job)
+    
+    return jobs
+
+
 class clops_benchmark:
 
     def __init__(self,
@@ -410,7 +476,10 @@ class clops_benchmark:
             self.job = run_parameterized(backend, width, layers, shots, rep_delay, num_circuits)
             self.clops = self._clops_throughput_sampler
         elif circuit_type == "instantiated":
-            raise ValueError("'circuit_type' instantiated not yet supported")
+            if batch_size is None:
+                raise ValueError("'batch_size' must be specified for instantiated circuit_type")
+            self.jobs = run_instantiated(backend, width, layers, shots, rep_delay, num_circuits, batch_size)
+            self.clops = self._clops_throughput_instantiated
         else:
             raise ValueError("'circuit_type' " + circuit_type + " invalid")
         
@@ -443,4 +512,46 @@ class clops_benchmark:
                       (end_time_last_sub_job - end_time_first_sub_job
         ).total_seconds())
 
+        return clops
+
+    def _clops_throughput_instantiated(self):
+        """
+        Measures the overall CLOPS throughput for instantiated circuits.
+        
+        For instantiated circuits, we calculate throughput across all batches
+        submitted in session mode. We use the time from the end of the first
+        batch's first sub-job to the end of the last batch's last sub-job,
+        excluding startup costs to measure steady-state throughput.
+        
+        Returns:
+            CLOPS value (Circuit Layer Operations Per Second)
+        """
+        all_spans = []
+        total_circuits = 0
+        
+        # Collect execution spans from all jobs
+        for job in self.jobs:
+            result = job.result()
+            execution_spans: ExecutionSpans = result.metadata["execution"]["execution_spans"]
+            spans = execution_spans.sort()
+            
+            for span in spans:
+                all_spans.append(span)
+                total_circuits += span.size
+        
+        # Sort all spans by start time
+        all_spans.sort(key=lambda s: s.start)
+        
+        # Calculate throughput from end of first sub-job to end of last sub-job
+        end_time_first_sub_job = all_spans[0].stop
+        end_time_last_sub_job = all_spans[-1].stop
+        
+        # Exclude first sub-job from circuit count (startup overhead)
+        circuits_for_throughput = total_circuits - all_spans[0].size
+        
+        clops = round(
+            (circuits_for_throughput * self.job_attributes["layers"]) /
+            (end_time_last_sub_job - end_time_first_sub_job).total_seconds()
+        )
+        
         return clops
